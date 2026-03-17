@@ -3,7 +3,7 @@
 ## Assembly order (N games)
 
 ```
-Intro → Deck Tech → Transition → Midroll Ad 1
+Intro → Deck Tech → Midroll Ad 1 → Transition
       → Game 1 → T → ... → Game ⌈N/2⌉  [fade out]
       → Midroll Ad 2
       → Game ⌈N/2⌉+1 → T → ... → Game N
@@ -12,8 +12,8 @@ Intro → Deck Tech → Transition → Midroll Ad 1
 
 ## Rules
 
-- Transition plays **after** deck tech — it bridges into the gameplay section, not between intro and deck tech.
-- No transition clip before or after any midroll ad — always hard cuts.
+- Transition plays **after Midroll Ad 1**, immediately before Game 1.
+- No transition before Midroll Ad 1, or on either side of Midroll Ad 2 — always hard cuts.
 - The content group immediately before each midroll ad fades out to black (`OUTPUT_FADE_DURATION`) before the hard cut.
 - Midroll Ad 2 is only inserted when there are ≥ 2 games; it splits the games at `ceil(num_games / 2)`.
 - Any asset with no path set or `_ENABLED=false` is silently skipped.

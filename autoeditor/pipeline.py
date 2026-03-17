@@ -27,12 +27,13 @@ def build_pipeline(project: ProjectFolder, config: Config) -> list[Segment]:
     """Return the ordered list of segments for a project.
 
     Default order for N games:
-      Intro > Transition > Deck Tech > Midroll Ad 1
+      Intro > Deck Tech > Midroll Ad 1 > Transition
       > Game 1 > T > ... > Game ceil(N/2) > Midroll Ad 2
       > Game ceil(N/2)+1 > T > ... > Game N > Outro
 
     Rules:
-    - No transition clip before/after midroll ads.
+    - Transition plays after Midroll Ad 1, immediately before Game 1.
+    - No transition before Midroll Ad 1 or on either side of Midroll Ad 2.
     - Midroll Ad 2 is skipped when there is only 1 game.
     - Any asset not configured (path is None) is simply omitted.
     """
@@ -43,11 +44,11 @@ def build_pipeline(project: ProjectFolder, config: Config) -> list[Segment]:
 
     segments.append(Segment(SegmentType.DECK_TECH, project.deck_tech, "Deck Tech"))
 
-    if config.transition_path:
-        segments.append(Segment(SegmentType.TRANSITION, config.transition_path, "Transition"))
-
     if config.midroll_ad_path_1 and config.midroll_ad_1_enabled:
         segments.append(Segment(SegmentType.MIDROLL_AD, config.midroll_ad_path_1, "Midroll Ad 1"))
+
+    if config.transition_path:
+        segments.append(Segment(SegmentType.TRANSITION, config.transition_path, "Transition"))
 
     games = project.games
     num_games = len(games)

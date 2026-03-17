@@ -57,7 +57,7 @@ Supported input formats: `.mp4`, `.mov`, `.mkv`, `.avi`.
 For a project with **N games**, the assembled output follows this order:
 
 ```
-Intro → Deck Tech → Transition → Midroll Ad 1
+Intro → Deck Tech → Midroll Ad 1 → Transition
       → Game 1 → Transition → ... → Game ⌈N/2⌉ [fade out]
       → Midroll Ad 2
       → Game ⌈N/2⌉+1 → Transition → ... → Game N
@@ -65,8 +65,8 @@ Intro → Deck Tech → Transition → Midroll Ad 1
 ```
 
 **Rules:**
-- The transition clip plays after the deck tech, bridging into the gameplay section.
-- There is no transition clip before or after a midroll ad — they always hard-cut in and out.
+- The transition clip plays after Midroll Ad 1, immediately before Game 1.
+- There is no transition before Midroll Ad 1, or on either side of Midroll Ad 2.
 - The content group immediately preceding each midroll ad fades out to black before the hard cut.
 - Midroll Ad 2 is only inserted when there are 2 or more games (it splits the games roughly in half).
 - Any asset whose path is unset or whose enabled flag is `false` is silently skipped.
@@ -75,7 +75,7 @@ Intro → Deck Tech → Transition → Midroll Ad 1
 **Example — 5 games:**
 
 ```
-Intro → Deck Tech → Transition [fade out] → Midroll Ad 1
+Intro → Deck Tech [fade out] → Midroll Ad 1 → Transition
       → Game 1 → T → Game 2 → T → Game 3 [fade out]
       → Midroll Ad 2
       → Game 4 → T → Game 5
