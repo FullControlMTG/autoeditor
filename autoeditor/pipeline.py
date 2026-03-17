@@ -41,10 +41,10 @@ def build_pipeline(project: ProjectFolder, config: Config) -> list[Segment]:
     if config.intro_path:
         segments.append(Segment(SegmentType.INTRO, config.intro_path, "Intro"))
 
+    segments.append(Segment(SegmentType.DECK_TECH, project.deck_tech, "Deck Tech"))
+
     if config.transition_path:
         segments.append(Segment(SegmentType.TRANSITION, config.transition_path, "Transition"))
-
-    segments.append(Segment(SegmentType.DECK_TECH, project.deck_tech, "Deck Tech"))
 
     if config.midroll_ad_path_1 and config.midroll_ad_1_enabled:
         segments.append(Segment(SegmentType.MIDROLL_AD, config.midroll_ad_path_1, "Midroll Ad 1"))

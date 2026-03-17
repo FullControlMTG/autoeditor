@@ -218,6 +218,27 @@ def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, f
 
 
 # ---------------------------------------------------------------------------
+# Fade-out only pass (used before midroll ad hard cuts)
+# ---------------------------------------------------------------------------
+
+def apply_fade_out(input_path: Path, output_path: Path, fade_dur: float) -> Path:
+    """Apply a video and audio fade-out to the end of a clip."""
+    info = probe_clip(input_path)
+    fade_out_start = max(0.0, info.duration - fade_dur)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", f"fade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
+        "-af", f"afade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+# ---------------------------------------------------------------------------
 # Group splitting
 # ---------------------------------------------------------------------------
 
@@ -306,6 +327,14 @@ def render_project(
                 labels = " > ".join(segments[i].label for i in indices)
                 log(f"    Group {g_idx + 1} [{labels}]: applying crossfade")
                 render_group_with_xfade(clips, group_out, config.fade_duration)
+
+            # If the next group is a midroll ad, fade out the end of this group.
+            next_is_midroll = (g_idx + 1 < len(groups)) and groups[g_idx + 1][0]
+            if not is_midroll and next_is_midroll and config.output_fade_duration > 0:
+                faded = tmp_dir / f"group_{g_idx:03d}_fadeout.mp4"
+                log(f"    → fading out before midroll ad")
+                apply_fade_out(group_out, faded, config.output_fade_duration)
+                group_out = faded
 
             group_outputs.append(group_out)
 
