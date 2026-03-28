@@ -58,6 +58,39 @@ def probe_clip(path: Path) -> ClipInfo:
 
 
 # ---------------------------------------------------------------------------
+# Encoder helpers
+# ---------------------------------------------------------------------------
+
+# Quality args per encoder. These are appended after -c:v <encoder>.
+_ENCODER_QUALITY: dict[str, list[str]] = {
+    "libx264":    ["-preset", "fast", "-crf", "18"],
+    "h264_nvenc": ["-preset", "p4", "-cq", "20"],
+    "h264_amf":   ["-quality", "balanced", "-qp_i", "20", "-qp_p", "20"],
+    "h264_qsv":   ["-preset", "fast", "-global_quality", "20"],
+}
+
+# Hardware decode args to insert before -i, per encoder.
+_ENCODER_HWACCEL: dict[str, list[str]] = {
+    "libx264":    [],
+    "h264_nvenc": ["-hwaccel", "cuda"],
+    "h264_amf":   [],
+    "h264_qsv":   ["-hwaccel", "qsv"],
+}
+
+
+def _encode_args(config: Config) -> list[str]:
+    """Return [-c:v <encoder> + quality flags] for the configured encoder."""
+    enc = config.video_encoder
+    quality = _ENCODER_QUALITY.get(enc, ["-preset", "fast", "-crf", "18"])
+    return ["-c:v", enc] + quality
+
+
+def _hwaccel_args(config: Config) -> list[str]:
+    """Return hardware-decode flags to place before -i, or [] for software decode."""
+    return _ENCODER_HWACCEL.get(config.video_encoder, [])
+
+
+# ---------------------------------------------------------------------------
 # Normalize
 # ---------------------------------------------------------------------------
 
@@ -83,13 +116,13 @@ def normalize_clip(input_path: Path, output_path: Path, config: Config) -> Path:
         f"format=yuv420p"
     )
 
-    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    cmd = ["ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path)]
 
     if not info.has_audio:
         # Synthesize a silent stereo audio stream for the duration of the clip.
         cmd += [
             "-f", "lavfi",
-            "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
         ]
         cmd += ["-map", "0:v", "-map", "1:a", "-shortest"]
     else:
@@ -97,7 +130,7 @@ def normalize_clip(input_path: Path, output_path: Path, config: Config) -> Path:
 
     cmd += [
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *_encode_args(config),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         str(output_path),
     ]
@@ -141,7 +174,7 @@ def _build_xfade_filter(n: int, durations: list[float], fade_dur: float) -> tupl
     return ";".join(parts), "vout", "aout"
 
 
-def render_group_with_xfade(clips: list[Path], output: Path, fade_dur: float) -> Path:
+def render_group_with_xfade(clips: list[Path], output: Path, fade_dur: float, config: Config) -> Path:
     """Merge a list of clips into one file using xfade crossfades."""
     if len(clips) == 1:
         shutil.copy(clips[0], output)
@@ -158,7 +191,7 @@ def render_group_with_xfade(clips: list[Path], output: Path, fade_dur: float) ->
         "-filter_complex", filter_complex,
         "-map", f"[{v_out}]",
         "-map", f"[{a_out}]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *_encode_args(config),
         "-c:a", "aac", "-b:a", "192k",
         str(output),
     ]
@@ -198,7 +231,7 @@ def concat_clips_demuxer(clips: list[Path], output: Path) -> Path:
 # Final fade-in / fade-out pass
 # ---------------------------------------------------------------------------
 
-def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, fade_out_dur: float) -> Path:
+def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, fade_out_dur: float, config: Config) -> Path:
     """Add a fade-in at the start and fade-out at the end of a video."""
     info = probe_clip(input_path)
     fade_out_start = max(0.0, info.duration - fade_out_dur)
@@ -207,9 +240,9 @@ def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, f
     af = f"afade=t=in:st=0:d={fade_in_dur},afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur}"
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
+        "ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path),
         "-vf", vf, "-af", af,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *_encode_args(config),
         "-c:a", "aac", "-b:a", "192k",
         str(output_path),
     ]
@@ -221,16 +254,16 @@ def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, f
 # Fade-out only pass (used before midroll ad hard cuts)
 # ---------------------------------------------------------------------------
 
-def apply_fade_out(input_path: Path, output_path: Path, fade_dur: float) -> Path:
+def apply_fade_out(input_path: Path, output_path: Path, fade_dur: float, config: Config) -> Path:
     """Apply a video and audio fade-out to the end of a clip."""
     info = probe_clip(input_path)
     fade_out_start = max(0.0, info.duration - fade_dur)
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
+        "ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path),
         "-vf", f"fade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
         "-af", f"afade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *_encode_args(config),
         "-c:a", "aac", "-b:a", "192k",
         str(output_path),
     ]
@@ -326,14 +359,14 @@ def render_project(
             else:
                 labels = " > ".join(segments[i].label for i in indices)
                 log(f"    Group {g_idx + 1} [{labels}]: applying crossfade")
-                render_group_with_xfade(clips, group_out, config.fade_duration)
+                render_group_with_xfade(clips, group_out, config.fade_duration, config)
 
             # If the next group is a midroll ad, fade out the end of this group.
             next_is_midroll = (g_idx + 1 < len(groups)) and groups[g_idx + 1][0]
             if not is_midroll and next_is_midroll and config.output_fade_duration > 0:
                 faded = tmp_dir / f"group_{g_idx:03d}_fadeout.mp4"
                 log(f"    → fading out before midroll ad")
-                apply_fade_out(group_out, faded, config.output_fade_duration)
+                apply_fade_out(group_out, faded, config.output_fade_duration, config)
                 group_out = faded
 
             group_outputs.append(group_out)
@@ -353,7 +386,7 @@ def render_project(
         # ------------------------------------------------------------------
         if config.output_fade_duration > 0:
             log("  Applying final fades...")
-            apply_final_fades(pre_fade, output_path, config.output_fade_duration, config.output_fade_duration)
+            apply_final_fades(pre_fade, output_path, config.output_fade_duration, config.output_fade_duration, config)
         else:
             shutil.copy(pre_fade, output_path)
 

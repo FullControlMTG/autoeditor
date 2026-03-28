@@ -21,6 +21,7 @@ class Config:
     target_fps: int
     fade_duration: float
     output_fade_duration: float
+    video_encoder: str
 
 
 def load_config() -> Config:
@@ -45,4 +46,5 @@ def load_config() -> Config:
         target_fps=int(os.getenv("TARGET_FPS", "30")),
         fade_duration=float(os.getenv("FADE_DURATION", "0.5")),
         output_fade_duration=float(os.getenv("OUTPUT_FADE_DURATION", "1.0")),
+        video_encoder=os.getenv("VIDEO_ENCODER", "libx264"),
     )

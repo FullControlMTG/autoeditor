@@ -9,25 +9,33 @@ A Python CLI tool for automatically stitching Magic: The Gathering content video
 - Python 3.10+
 - [ffmpeg](https://ffmpeg.org/download.html) and `ffprobe` installed and available on your `PATH`
 
-Install Python dependencies:
+---
+
+## Setup
+
+**1. Create and activate a virtual environment:**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   (*nix)
+.venv\Scripts\activate   (Windows)
+```
+
+**2. Install dependencies:**
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-## Setup
-
-1. Copy the example config and fill in your values:
+**3. Copy the example config and fill in your values:**
 
 ```bash
 cp .env.example .env
 ```
 
-2. Edit `.env` with your asset paths and preferences (see [Configuration](#configuration) below).
+**4.** Edit `.env` with your asset paths and preferences (see [Configuration](#configuration) below).
 
-3. Place your project recording folders inside the folder pointed to by `PROJECT_FOLDER_PATH`.
+**5.** Place your project recording folders inside the folder pointed to by `PROJECT_FOLDER_PATH`.
 
 ---
 
@@ -209,6 +217,7 @@ Copy `.env.example` to `.env` and edit as needed. All paths accept forward slash
 | `TARGET_FPS` | Output frame rate | `60` |
 | `FADE_DURATION` | Crossfade duration in seconds between clips within a group. `0` = hard cuts | `0.3` |
 | `OUTPUT_FADE_DURATION` | Fade-in / fade-out duration in seconds on the final output. `0` = no fade | `0.5` |
+| `VIDEO_ENCODER` | ffmpeg video encoder: `libx264` (CPU), `h264_nvenc` (NVIDIA), `h264_amf` (AMD), `h264_qsv` (Intel) | `libx264` |
 
 ---
 
