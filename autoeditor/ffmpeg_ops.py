@@ -1,8 +1,14 @@
-"""Low-level ffmpeg operations used by the render pipeline."""
+"""Low-level ffmpeg operations — single-pass pipeline.
+
+All source clips are fed as inputs to a single ffmpeg call. A filter_complex
+graph normalises every clip, builds crossfades within groups, applies fade-out
+before midroll ads, hard-cuts between groups, and applies final fade-in/out —
+all in one encode pass with no intermediate files.
+"""
 
 import json
-import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,20 +67,11 @@ def probe_clip(path: Path) -> ClipInfo:
 # Encoder helpers
 # ---------------------------------------------------------------------------
 
-# Quality args per encoder. These are appended after -c:v <encoder>.
 _ENCODER_QUALITY: dict[str, list[str]] = {
     "libx264":    ["-preset", "fast", "-crf", "18"],
     "h264_nvenc": ["-preset", "p4", "-cq", "20"],
     "h264_amf":   ["-quality", "balanced", "-qp_i", "20", "-qp_p", "20"],
     "h264_qsv":   ["-preset", "fast", "-global_quality", "20"],
-}
-
-# Hardware decode args to insert before -i, per encoder.
-_ENCODER_HWACCEL: dict[str, list[str]] = {
-    "libx264":    [],
-    "h264_nvenc": ["-hwaccel", "cuda"],
-    "h264_amf":   [],
-    "h264_qsv":   ["-hwaccel", "qsv"],
 }
 
 
@@ -85,202 +82,16 @@ def _encode_args(config: Config) -> list[str]:
     return ["-c:v", enc] + quality
 
 
-def _hwaccel_args(config: Config) -> list[str]:
-    """Return hardware-decode flags to place before -i, or [] for software decode."""
-    return _ENCODER_HWACCEL.get(config.video_encoder, [])
-
-
-# ---------------------------------------------------------------------------
-# Normalize
-# ---------------------------------------------------------------------------
-
-def normalize_clip(input_path: Path, output_path: Path, config: Config) -> Path:
-    """Re-encode a clip to the common target format.
-
-    Handles:
-    - Scaling / padding to target resolution with black bars
-    - FPS conversion
-    - Adding a silent audio track if the source has no audio
-    - h264 video + aac audio at 48 kHz stereo
-    """
-    w, h = config.target_resolution.split("x")
-    width, height = int(w), int(h)
-    fps = config.target_fps
-
-    info = probe_clip(input_path)
-
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps},"
-        f"format=yuv420p"
-    )
-
-    cmd = ["ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path)]
-
-    if not info.has_audio:
-        # Synthesize a silent stereo audio stream for the duration of the clip.
-        cmd += [
-            "-f", "lavfi",
-            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-        ]
-        cmd += ["-map", "0:v", "-map", "1:a", "-shortest"]
-    else:
-        cmd += ["-map", "0:v", "-map", "0:a"]
-
-    cmd += [
-        "-vf", vf,
-        *_encode_args(config),
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        str(output_path),
-    ]
-
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
-
-
-# ---------------------------------------------------------------------------
-# Crossfade render for a single group
-# ---------------------------------------------------------------------------
-
-def _build_xfade_filter(n: int, durations: list[float], fade_dur: float) -> tuple[str, str, str]:
-    """Build filter_complex, video_out_label, audio_out_label for N clips."""
-    if n == 1:
-        return "", "0:v", "0:a"
-
-    parts = []
-    cumulative = 0.0
-
-    for i in range(n - 1):
-        # Timeline offset where the crossfade should begin
-        offset = max(0.0, cumulative + durations[i] - (i + 1) * fade_dur)
-        cumulative += durations[i]
-
-        v_in1 = "[0:v]" if i == 0 else f"[xv{i}]"
-        v_in2 = f"[{i + 1}:v]"
-        v_out = "[vout]" if i == n - 2 else f"[xv{i + 1}]"
-
-        a_in1 = "[0:a]" if i == 0 else f"[xa{i}]"
-        a_in2 = f"[{i + 1}:a]"
-        a_out = "[aout]" if i == n - 2 else f"[xa{i + 1}]"
-
-        parts.append(
-            f"{v_in1}{v_in2}xfade=transition=fade:duration={fade_dur}:offset={offset:.3f}{v_out}"
-        )
-        parts.append(
-            f"{a_in1}{a_in2}acrossfade=d={fade_dur}:c1=tri:c2=tri{a_out}"
-        )
-
-    return ";".join(parts), "vout", "aout"
-
-
-def render_group_with_xfade(clips: list[Path], output: Path, fade_dur: float, config: Config) -> Path:
-    """Merge a list of clips into one file using xfade crossfades."""
-    if len(clips) == 1:
-        shutil.copy(clips[0], output)
-        return output
-
-    durations = [probe_clip(c).duration for c in clips]
-    filter_complex, v_out, a_out = _build_xfade_filter(len(clips), durations, fade_dur)
-
-    cmd = ["ffmpeg", "-y"]
-    for clip in clips:
-        cmd += ["-i", str(clip)]
-
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", f"[{v_out}]",
-        "-map", f"[{a_out}]",
-        *_encode_args(config),
-        "-c:a", "aac", "-b:a", "192k",
-        str(output),
-    ]
-
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Hard-cut concatenation (concat demuxer, stream copy)
-# ---------------------------------------------------------------------------
-
-def concat_clips_demuxer(clips: list[Path], output: Path) -> Path:
-    """Fast stream-copy concatenation. Requires all clips to share codec/resolution/fps."""
-    if len(clips) == 1:
-        shutil.copy(clips[0], output)
-        return output
-
-    list_file = output.parent / f"_concatlist_{output.stem}.txt"
-    with open(list_file, "w") as f:
-        for clip in clips:
-            f.write(f"file '{clip.resolve().as_posix()}'\n")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(list_file),
-        "-c", "copy",
-        str(output),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    list_file.unlink()
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Final fade-in / fade-out pass
-# ---------------------------------------------------------------------------
-
-def apply_final_fades(input_path: Path, output_path: Path, fade_in_dur: float, fade_out_dur: float, config: Config) -> Path:
-    """Add a fade-in at the start and fade-out at the end of a video."""
-    info = probe_clip(input_path)
-    fade_out_start = max(0.0, info.duration - fade_out_dur)
-
-    vf = f"fade=t=in:st=0:d={fade_in_dur},fade=t=out:st={fade_out_start:.3f}:d={fade_out_dur}"
-    af = f"afade=t=in:st=0:d={fade_in_dur},afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur}"
-
-    cmd = [
-        "ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path),
-        "-vf", vf, "-af", af,
-        *_encode_args(config),
-        "-c:a", "aac", "-b:a", "192k",
-        str(output_path),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
-
-
-# ---------------------------------------------------------------------------
-# Fade-out only pass (used before midroll ad hard cuts)
-# ---------------------------------------------------------------------------
-
-def apply_fade_out(input_path: Path, output_path: Path, fade_dur: float, config: Config) -> Path:
-    """Apply a video and audio fade-out to the end of a clip."""
-    info = probe_clip(input_path)
-    fade_out_start = max(0.0, info.duration - fade_dur)
-
-    cmd = [
-        "ffmpeg", "-y", *_hwaccel_args(config), "-i", str(input_path),
-        "-vf", f"fade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
-        "-af", f"afade=t=out:st={fade_out_start:.3f}:d={fade_dur}",
-        *_encode_args(config),
-        "-c:a", "aac", "-b:a", "192k",
-        str(output_path),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
-
-
 # ---------------------------------------------------------------------------
 # Group splitting
 # ---------------------------------------------------------------------------
 
 def _split_into_groups(segments: list[Segment]) -> list[tuple[bool, list[int]]]:
-    """Split segment indices into groups separated by midroll ads.
+    """Split segment indices into groups at midroll ad boundaries.
 
-    Returns a list of (is_midroll_ad, [segment_indices]) tuples.
-    Midroll ads are isolated into their own single-item groups so that the
-    surrounding content is always hard-cut to/from them.
+    Returns list of (is_midroll_ad, [segment_indices]).
+    Each midroll ad is isolated into its own single-item group so that the
+    surrounding content always hard-cuts to/from it.
     """
     groups: list[tuple[bool, list[int]]] = []
     current: list[int] = []
@@ -301,6 +112,267 @@ def _split_into_groups(segments: list[Segment]) -> list[tuple[bool, list[int]]]:
 
 
 # ---------------------------------------------------------------------------
+# Duration helpers
+# ---------------------------------------------------------------------------
+
+def _group_duration(
+    indices: list[int],
+    clips: list[ClipInfo],
+    fade_dur: float,
+) -> float:
+    """Effective output duration of a group, accounting for xfade overlap."""
+    durations = [clips[i].duration for i in indices]
+    n = len(durations)
+    if n <= 1 or fade_dur <= 0:
+        return sum(durations)
+    return sum(durations) - (n - 1) * fade_dur
+
+
+# ---------------------------------------------------------------------------
+# Filter graph builder
+# ---------------------------------------------------------------------------
+
+def _build_filter_complex(
+    clips: list[ClipInfo],
+    groups: list[tuple[bool, list[int]]],
+    config: Config,
+) -> tuple[str, str, str]:
+    """Build the complete filter_complex for a single-pass render.
+
+    Returns (filter_complex_string, v_out_label, a_out_label).
+
+    Graph structure
+    ---------------
+    For each input clip i:
+      [i:v] → scale/pad/fps/format    → [vni]
+      [i:a] → aresample/aformat       → [ani]   (or aevalsrc if no audio)
+
+    For each content group g:
+      [vni][vnj]... → xfade chain     → [vxg]   (or hard concat if fade=0)
+      [ani][anj]... → acrossfade chain → [axg]
+
+    If group g precedes a midroll ad:
+      [vxg] → fade=out                → [vfog]
+      [axg] → afade=out               → [afog]
+
+    All groups:
+      [vg0][ag0][vg1][ag1]... → concat → [vpre][apre]
+
+    Final:
+      [vpre] → fade=in,fade=out       → [vout]
+      [apre] → afade=in,afade=out     → [aout]
+    """
+    w, h = config.target_resolution.split("x")
+    width, height = int(w), int(h)
+    fps = config.target_fps
+    fade_dur = config.fade_duration
+    out_fade = config.output_fade_duration
+
+    parts: list[str] = []
+
+    # ------------------------------------------------------------------
+    # 1. Per-clip normalisation
+    # ------------------------------------------------------------------
+    for i, clip in enumerate(clips):
+        parts.append(
+            f"[{i}:v]"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"fps={fps},"
+            f"format=yuv420p"
+            f"[vn{i}]"
+        )
+        if clip.has_audio:
+            parts.append(
+                f"[{i}:a]"
+                f"aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo"
+                f"[an{i}]"
+            )
+        else:
+            # Synthesise a silent stereo track matching the clip duration.
+            parts.append(
+                f"aevalsrc=exprs=0:c=stereo:r=48000:d={clip.duration:.6f}[an{i}]"
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Per-group processing
+    # ------------------------------------------------------------------
+    group_v: list[str] = []
+    group_a: list[str] = []
+
+    for g, (is_midroll, indices) in enumerate(groups):
+        n = len(indices)
+
+        if n == 1:
+            # Single clip — pass the normalised labels through unchanged.
+            v_label = f"vn{indices[0]}"
+            a_label = f"an{indices[0]}"
+
+        elif is_midroll or fade_dur <= 0:
+            # Hard-cut concat within the group (midroll or crossfade disabled).
+            inputs = "".join(f"[vn{i}][an{i}]" for i in indices)
+            v_label = f"vhc{g}"
+            a_label = f"ahc{g}"
+            parts.append(
+                f"{inputs}concat=n={n}:v=1:a=1[{v_label}][{a_label}]"
+            )
+
+        else:
+            # xfade / acrossfade chain across all clips in the group.
+            durations = [clips[i].duration for i in indices]
+            cumulative = 0.0
+
+            for k in range(n - 1):
+                offset = max(0.0, cumulative + durations[k] - (k + 1) * fade_dur)
+                cumulative += durations[k]
+
+                is_last_pair = (k == n - 2)
+                v_in1 = f"[vn{indices[0]}]"  if k == 0 else f"[vxi{g}_{k}]"
+                v_in2 = f"[vn{indices[k + 1]}]"
+                v_out = f"[vx{g}]"           if is_last_pair else f"[vxi{g}_{k + 1}]"
+
+                a_in1 = f"[an{indices[0]}]"  if k == 0 else f"[axi{g}_{k}]"
+                a_in2 = f"[an{indices[k + 1]}]"
+                a_out = f"[ax{g}]"           if is_last_pair else f"[axi{g}_{k + 1}]"
+
+                parts.append(
+                    f"{v_in1}{v_in2}"
+                    f"xfade=transition=fade:duration={fade_dur}:offset={offset:.3f}"
+                    f"{v_out}"
+                )
+                parts.append(
+                    f"{a_in1}{a_in2}"
+                    f"acrossfade=d={fade_dur}:c1=tri:c2=tri"
+                    f"{a_out}"
+                )
+
+            v_label = f"vx{g}"
+            a_label = f"ax{g}"
+
+        # Fade-out at the end of any content group that precedes a midroll ad.
+        next_is_midroll = (g + 1 < len(groups)) and groups[g + 1][0]
+        if not is_midroll and next_is_midroll and out_fade > 0:
+            grp_dur = _group_duration(indices, clips, fade_dur)
+            fo_start = max(0.0, grp_dur - out_fade)
+            parts.append(
+                f"[{v_label}]fade=t=out:st={fo_start:.3f}:d={out_fade}[vfo{g}]"
+            )
+            parts.append(
+                f"[{a_label}]afade=t=out:st={fo_start:.3f}:d={out_fade}[afo{g}]"
+            )
+            v_label = f"vfo{g}"
+            a_label = f"afo{g}"
+
+        group_v.append(v_label)
+        group_a.append(a_label)
+
+    # ------------------------------------------------------------------
+    # 3. Hard-cut concat across all groups
+    # ------------------------------------------------------------------
+    if len(groups) == 1:
+        v_pre, a_pre = group_v[0], group_a[0]
+    else:
+        interleaved = "".join(
+            f"[{v}][{a}]" for v, a in zip(group_v, group_a)
+        )
+        parts.append(
+            f"{interleaved}concat=n={len(groups)}:v=1:a=1[vpre][apre]"
+        )
+        v_pre, a_pre = "vpre", "apre"
+
+    # ------------------------------------------------------------------
+    # 4. Final fade-in at the very start, fade-out at the very end
+    # ------------------------------------------------------------------
+    if out_fade > 0:
+        total_dur = sum(
+            _group_duration(indices, clips, fade_dur if not is_midroll else 0)
+            for is_midroll, indices in groups
+        )
+        fo_start = max(0.0, total_dur - out_fade)
+        parts.append(
+            f"[{v_pre}]"
+            f"fade=t=in:st=0:d={out_fade},"
+            f"fade=t=out:st={fo_start:.3f}:d={out_fade}"
+            f"[vout]"
+        )
+        parts.append(
+            f"[{a_pre}]"
+            f"afade=t=in:st=0:d={out_fade},"
+            f"afade=t=out:st={fo_start:.3f}:d={out_fade}"
+            f"[aout]"
+        )
+        v_out_label, a_out_label = "vout", "aout"
+    else:
+        v_out_label, a_out_label = v_pre, a_pre
+
+    return ";".join(parts), v_out_label, a_out_label
+
+
+# ---------------------------------------------------------------------------
+# Progress helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_time(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _run_with_progress(cmd: list[str], total_dur: float) -> None:
+    """Run an ffmpeg command and stream a live progress line to the console.
+
+    -progress pipe:1 must be placed as a global option (before -i flags) so
+    ffmpeg writes key=value progress data to stdout. A background thread drains
+    stderr concurrently to prevent the pipe buffer from filling and deadlocking.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+    # Drain stderr in a background thread to prevent pipe-buffer deadlock.
+    # ffmpeg writes filter graph analysis and encoder setup there before any
+    # progress data appears on stdout, which can fill the 64 KB buffer.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr() -> None:
+        for line in proc.stderr:  # type: ignore[union-attr]
+            stderr_lines.append(line)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    out_time_us = 0
+    speed = ""
+
+    for raw in proc.stdout:  # type: ignore[union-attr]
+        line = raw.strip()
+        if line.startswith("out_time_us="):
+            try:
+                out_time_us = int(line.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif line.startswith("speed="):
+            speed = line.split("=", 1)[1].strip()
+        elif line.startswith("progress="):
+            elapsed = out_time_us / 1_000_000
+            pct = min(100.0, (elapsed / total_dur) * 100) if total_dur > 0 else 0
+            timing = f"{_fmt_time(elapsed)} / {_fmt_time(total_dur)} ({pct:.0f}%)"
+            speed_str = f"  @ {speed}" if speed not in ("", "N/A") else ""
+            print(f"\r  Rendering: {timing}{speed_str}   ", end="", flush=True)
+
+    proc.wait()
+    stderr_thread.join()
+    print()  # move past the progress line
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, stderr="".join(stderr_lines)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main render entry point
 # ---------------------------------------------------------------------------
 
@@ -311,87 +383,52 @@ def render_project(
     *,
     verbose: bool = True,
 ) -> Path:
-    """Full pipeline: normalize → group → xfade within groups → concat → final fades."""
+    """Single-pass render: probe all clips → build filter_complex → one ffmpeg call.
 
+    No intermediate files are written. All normalisation, crossfading, and
+    fading happens inside a single filter_complex graph.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = output_path.parent / f"_tmp_{output_path.stem}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     def log(msg: str) -> None:
         if verbose:
             print(msg)
 
-    try:
-        # ------------------------------------------------------------------
-        # Step 1: Normalize every segment clip
-        # ------------------------------------------------------------------
-        log("  Normalizing clips...")
-        normalized: dict[int, Path] = {}
-        for i, seg in enumerate(segments):
-            norm_path = tmp_dir / f"norm_{i:03d}_{seg.type.name.lower()}.mp4"
-            log(f"    [{i + 1}/{len(segments)}] {seg.label}: {seg.path.name}")
-            normalize_clip(seg.path, norm_path, config)
-            normalized[i] = norm_path
+    # Step 1: Probe (reads metadata only — no decode)
+    log("  Probing clips...")
+    clips: list[ClipInfo] = []
+    for seg in segments:
+        log(f"    {seg.label}: {seg.path.name}")
+        clips.append(probe_clip(seg.path))
 
-        # ------------------------------------------------------------------
-        # Step 2: Split into groups (isolated midroll ads + content groups)
-        # ------------------------------------------------------------------
-        groups = _split_into_groups(segments)
+    # Step 2: Build filter graph
+    groups = _split_into_groups(segments)
+    log(f"  Building filter graph ({len(segments)} clips, {len(groups)} group(s))...")
+    filter_complex, v_out, a_out = _build_filter_complex(clips, groups, config)
 
-        # ------------------------------------------------------------------
-        # Step 3: Render each group
-        # ------------------------------------------------------------------
-        log("  Merging groups...")
-        group_outputs: list[Path] = []
+    # Step 3: Single ffmpeg call — all inputs, one encode pass.
+    # -progress and -nostats are global options and must precede all -i flags.
+    cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats"]
+    for seg in segments:
+        cmd += ["-i", str(seg.path)]
 
-        for g_idx, (is_midroll, indices) in enumerate(groups):
-            clips = [normalized[i] for i in indices]
-            group_out = tmp_dir / f"group_{g_idx:03d}.mp4"
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", f"[{v_out}]",
+        "-map", f"[{a_out}]",
+        *_encode_args(config),
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        str(output_path),
+    ]
 
-            if is_midroll or len(clips) == 1 or config.fade_duration <= 0:
-                if len(clips) == 1:
-                    shutil.copy(clips[0], group_out)
-                    group_label = segments[indices[0]].label
-                else:
-                    concat_clips_demuxer(clips, group_out)
-                    group_label = f"group {g_idx + 1}"
-                log(f"    {group_label}: hard cut (no crossfade)")
-            else:
-                labels = " > ".join(segments[i].label for i in indices)
-                log(f"    Group {g_idx + 1} [{labels}]: applying crossfade")
-                render_group_with_xfade(clips, group_out, config.fade_duration, config)
+    if verbose:
+        total_dur = sum(
+            _group_duration(indices, clips, config.fade_duration if not is_midroll else 0)
+            for is_midroll, indices in groups
+        )
+        _run_with_progress(cmd, total_dur)
+    else:
+        subprocess.run(cmd, check=True, capture_output=True)
 
-            # If the next group is a midroll ad, fade out the end of this group.
-            next_is_midroll = (g_idx + 1 < len(groups)) and groups[g_idx + 1][0]
-            if not is_midroll and next_is_midroll and config.output_fade_duration > 0:
-                faded = tmp_dir / f"group_{g_idx:03d}_fadeout.mp4"
-                log(f"    → fading out before midroll ad")
-                apply_fade_out(group_out, faded, config.output_fade_duration, config)
-                group_out = faded
-
-            group_outputs.append(group_out)
-
-        # ------------------------------------------------------------------
-        # Step 4: Hard-cut concat all groups
-        # ------------------------------------------------------------------
-        if len(group_outputs) == 1:
-            pre_fade = group_outputs[0]
-        else:
-            log("  Concatenating all groups...")
-            pre_fade = tmp_dir / "pre_fade.mp4"
-            concat_clips_demuxer(group_outputs, pre_fade)
-
-        # ------------------------------------------------------------------
-        # Step 5: Apply final fade-in / fade-out
-        # ------------------------------------------------------------------
-        if config.output_fade_duration > 0:
-            log("  Applying final fades...")
-            apply_final_fades(pre_fade, output_path, config.output_fade_duration, config.output_fade_duration, config)
-        else:
-            shutil.copy(pre_fade, output_path)
-
-        log(f"  Output: {output_path}")
-        return output_path
-
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    log(f"  Output: {output_path}")
+    return output_path

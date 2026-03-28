@@ -25,13 +25,16 @@ Project folders are named `YYYY.MM.DD-deck-name` (e.g. `2026.03.13-jeskai-contro
 `describe_pipeline()` returns a human-readable string used by `--dry-run`.
 
 ## ffmpeg_ops.py
+Single-pass architecture — all source clips are inputs to one ffmpeg call. No intermediate files.
+
 - `probe_clip(path)` → `ClipInfo` (duration, resolution, fps, has_audio)
-- `normalize_clip(input, output, config)` — re-encodes to h264/aac, adds silent audio if missing, scales/pads to target resolution
-- `render_group_with_xfade(clips, output, fade_dur)` — chains `xfade` + `acrossfade` filters across N clips
-- `concat_clips_demuxer(clips, output)` — fast stream-copy concat via ffmpeg concat demuxer
-- `apply_final_fades(input, output, fade_in, fade_out)` — fade in at start + fade out at end of final output
-- `apply_fade_out(input, output, fade_dur)` — fade out only, used before midroll ad hard cuts
-- `render_project(segments, output, config)` — full pipeline orchestrator; temp files in `_tmp_<name>/`, cleaned up on completion
+- `_split_into_groups(segments)` → groups segments at midroll ad boundaries; each midroll is isolated as a single-item group
+- `_group_duration(indices, clips, fade_dur)` → effective output duration of a group after xfade overlap
+- `_build_filter_complex(clips, groups, config)` → builds the complete filter_complex string:
+  - Per-clip: `scale/pad/fps/format` for video; `aresample/aformat` for audio; `aevalsrc` for clips with no audio track
+  - Per-group: `xfade`+`acrossfade` chain (or hard `concat` if `FADE_DURATION=0`); `fade=out`+`afade=out` on groups before midrolls
+  - Final: `concat` across all groups, then `fade=in/out`+`afade=in/out` on the assembled output
+- `render_project(segments, output, config)` → probes all clips, calls `_build_filter_complex`, runs one ffmpeg command
 
 ## cli.py
 Three commands, all support `--dry-run`:

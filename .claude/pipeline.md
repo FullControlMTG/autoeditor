@@ -19,7 +19,7 @@ Intro → Deck Tech → Midroll Ad 1 → Transition
 - Any asset with no path set or `_ENABLED=false` is silently skipped.
 - Global fade-in at the very start and fade-out at the very end of the final output.
 
-## Rendering steps (render_project)
+## Rendering steps ()
 
 1. **Normalize** all clips — h264/aac 48kHz stereo, target resolution (letterboxed), target FPS. Silent audio synthesised if source has no audio track.
 2. **Split into groups** — midroll ads are isolated as single-item groups; all other consecutive segments form content groups.
